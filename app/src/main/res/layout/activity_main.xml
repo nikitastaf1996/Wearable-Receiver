@@ -3,8 +3,8 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
     android:gravity="center"
+    android:orientation="vertical"
     android:padding="16dp"
     tools:context=".MainActivity">
 
@@ -21,12 +21,13 @@
         android:layout_marginTop="20dp"
         android:text="Status: Disconnected"
         android:textSize="18sp" />
+
     <Button
         android:id="@+id/getBatteryButton"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="Get Battery Level"
-        android:enabled="false" />  <!-- Initially disabled -->
+        android:enabled="false"
+        android:text="Get Battery Level" />  <!-- Initially disabled -->
 
     <TextView
         android:id="@+id/batteryTextView"
@@ -35,13 +36,14 @@
         android:layout_marginTop="8dp"
         android:text="Battery: --%"
         android:textSize="16sp" />
+
     <Button
         android:id="@+id/subscribeNotifyButton"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="Start recording"
-        android:enabled="false" /> <!-- Initially disabled -->
+        android:enabled="false"
+        android:text="Start recording" /> <!-- Initially disabled -->
 
     <TextView
         android:id="@+id/notifyDataTextView"

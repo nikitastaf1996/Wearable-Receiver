@@ -1,39 +1,54 @@
 package com.example.wearablereceiver
 
 import android.Manifest
-import java.io.OutputStreamWriter
-import android.content.ContentValues // <--- ADD THIS
-import android.provider.MediaStore    // <--- ADD THIS
-import android.os.Environment       // <--- ADD THIS (for Environment.DIRECTORY_DOWNLOADS)
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.bluetooth.*
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.provider.MediaStore
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import java.io.BufferedWriter
-import java.io.FileOutputStream
+// import java.io.FileOutputStream // No longer directly used by BleService
+import java.io.OutputStreamWriter
 import java.util.UUID
 
+/**
+ * Service for managing BLE connection, communication, and data logging.
+ *
+ * This service handles scanning for BLE devices, connecting to a specified device,
+ * discovering services and characteristics, reading data (like battery level),
+ * subscribing to notifications (like heart rate), and logging received data to a file.
+ * It also provides a binding interface for `MainActivity` to interact with it.
+ */
 class BleService : Service() {
 
     private val binder = LocalBinder()
@@ -43,46 +58,56 @@ class BleService : Service() {
     private var batteryLevelCharacteristic: BluetoothGattCharacteristic? = null
     private var heartRateReceiverCharacteristic: BluetoothGattCharacteristic? = null
     private var workoutCharacteristic: BluetoothGattCharacteristic? = null
-    private var fileOutputStream: FileOutputStream? = null
-    private var writer: BufferedWriter? = null
-    private var currentFileUri: Uri? = null // To store the URI of the file being written
 
     private var fileWriterHandlerThread: HandlerThread? = null
     private var fileWriterHandler: Handler? = null
+    private lateinit var heartRateFileLogger: HeartRateFileLogger
 
     // TODO: REPLACE WITH YOUR WEARABLE'S MAC ADDRESS (Can be passed via Intent if dynamic)
     private var targetDeviceAddress: String = "78:02:B7:78:38:39" // Default, can be overridden
 
     private var isScanning = false
     private val handler = Handler(Looper.getMainLooper())
-    private val SCAN_PERIOD: Long = 15000 // Increased scan period for service
+    private val SCAN_PERIOD: Long = 15000
 
     private var mIsConnected: Boolean = false
     private var isSubscribedToNotifications: Boolean = false
+    private var currentGeneralStatus: String = "Status Idle" // Instance variable
 
+    /**
+     * Binder for clients (e.g., `MainActivity`) to interact with this service.
+     */
     inner class LocalBinder : Binder() {
+        /** Returns this instance of BleService so clients can call public methods. */
         fun getService(): BleService = this@BleService
     }
 
-    override fun onBind(intent: Intent?): IBinder = binder // Or return null if you don't need binding
+    /**
+     * Called when a client binds to the service.
+     * @param intent The Intent that was used to bind to this service.
+     * @return Return an IBinder through which clients can call on to the service.
+     */
+    override fun onBind(intent: Intent?): IBinder = binder
 
     companion object {
         private const val TAG = "BleService"
         const val NOTIFICATION_ID = 1
         const val CHANNEL_ID = "BleServiceChannel"
 
-        private var currentGeneralStatus: String = "Status Idle" // Or some initial default
+        // currentGeneralStatus has been moved to an instance variable
         @JvmField
         var isServiceRunning:Boolean = false
         // Actions for Intents
         const val ACTION_START_SCAN = "com.example.wearablereceiver.ACTION_START_SCAN"
-        const val ACTION_CONNECT_DEVICE = "com.example.wearablereceiver.ACTION_CONNECT_DEVICE" // If address is known
+        const val ACTION_CONNECT_DEVICE = "com.example.wearablereceiver.ACTION_CONNECT_DEVICE"
         const val ACTION_DISCONNECT = "com.example.wearablereceiver.ACTION_DISCONNECT"
         const val ACTION_REQUEST_BATTERY = "com.example.wearablereceiver.ACTION_REQUEST_BATTERY"
         const val ACTION_TOGGLE_NOTIFY = "com.example.wearablereceiver.ACTION_TOGGLE_NOTIFY"
         const val ACTION_STOP_SERVICE = "com.example.wearablereceiver.ACTION_STOP_SERVICE"
 
         const val ACTION_REQUEST_CURRENT_STATE = "com.example.wearablereceiver.ACTION_REQUEST_CURRENT_STATE"
+        // TODO: Add KDocs for public constants if desired, e.g., for actions and extras.
+        // For brevity in this exercise, focusing on classes and methods.
 
         // Extra keys for Intents
         const val EXTRA_DEVICE_ADDRESS = "com.example.wearablereceiver.EXTRA_DEVICE_ADDRESS"
@@ -91,11 +116,11 @@ class BleService : Service() {
         const val ACTION_STATUS_UPDATE = "com.example.wearablereceiver.ACTION_STATUS_UPDATE"
         const val ACTION_BATTERY_LEVEL_UPDATE = "com.example.wearablereceiver.ACTION_BATTERY_LEVEL_UPDATE"
         const val ACTION_NOTIFICATION_DATA_UPDATE = "com.example.wearablereceiver.ACTION_NOTIFICATION_DATA_UPDATE"
-        const val ACTION_SERVICES_DISCOVERED_STATUS = "com.example.wearablereceiver.ACTION_SERVICES_DISCOVERED_STATUS" // To enable buttons
+        const val ACTION_SERVICES_DISCOVERED_STATUS = "com.example.wearablereceiver.ACTION_SERVICES_DISCOVERED_STATUS"
         const val ACTION_GATT_CONNECTED = "com.example.wearablereceiver.ACTION_GATT_CONNECTED"
         const val ACTION_GATT_DISCONNECTED = "com.example.wearablereceiver.ACTION_GATT_DISCONNECTED"
         const val ACTION_SCAN_FAILED = "com.example.wearablereceiver.ACTION_SCAN_FAILED"
-        const val ACTION_DEVICE_FOUND = "com.example.wearablereceiver.ACTION_DEVICE_FOUND" // Could be useful
+        const val ACTION_DEVICE_FOUND = "com.example.wearablereceiver.ACTION_DEVICE_FOUND"
         const val ACTION_NOTIFICATION_SUBSCRIPTION_CHANGED = "com.example.wearablereceiver.ACTION_NOTIFICATION_SUBSCRIPTION_CHANGED"
 
 
@@ -109,7 +134,7 @@ class BleService : Service() {
         const val EXTRA_SCAN_ERROR_CODE = "com.example.wearablereceiver.EXTRA_SCAN_ERROR_CODE"
 
 
-        // UUIDs (same as before)
+        // UUIDs
         val BATTERY_SERVICE_UUID: UUID = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
         val BATTERY_LEVEL_CHARACTERISTIC_UUID: UUID = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
         val HEART_RATE_SERVICE_UUID: UUID = UUID.fromString("000055ff-0000-1000-8000-00805f9b34fb")
@@ -118,6 +143,10 @@ class BleService : Service() {
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 
+    /**
+     * Called by the system when the service is first created.
+     * Initializes Bluetooth adapter, scanner, notification channel, and file logger.
+     */
     override fun onCreate() {
         super.onCreate()
         isServiceRunning = true
@@ -126,11 +155,15 @@ class BleService : Service() {
         bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
 
         createNotificationChannel()
-        currentGeneralStatus = "Service Initializing"
+        currentGeneralStatus = "Service Initializing" // Now correctly refers to instance var
         val notification = createNotification("BLE Service Running")
         startForeground(NOTIFICATION_ID, notification)
+
         fileWriterHandlerThread = HandlerThread("FileWriterThread").apply { start() }
         fileWriterHandler = Handler(fileWriterHandlerThread!!.looper)
+        heartRateFileLogger = HeartRateFileLogger(applicationContext, fileWriterHandler!!) { message ->
+           broadcastStatus(message)
+        }
         Log.d(TAG, "BleService created and started in foreground.")
     }
 
@@ -148,8 +181,11 @@ class BleService : Service() {
 
     private fun createNotification(text: String): Notification {
         val notificationIntent = Intent(this, MainActivity::class.java)
-        val pendingIntentFlags =
+        val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
         val pendingIntent = PendingIntent.getActivity(this, 0, notificationIntent, pendingIntentFlags)
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -168,109 +204,189 @@ class BleService : Service() {
     }
 
 
+    /**
+     * Called by the system every time a client starts the service using `startService(Intent)`.
+     * Handles incoming intents, which can trigger actions like scanning, connecting, or data requests.
+     * @param intent The Intent supplied to `startService(Intent)`.
+     * @param flags Additional data about this start request.
+     * @param startId A unique integer representing this specific request to start.
+     * @return The return value indicates what semantics the system should use for the service's
+     *         current started state.
+     */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "onStartCommand received action: ${intent?.action}")
         intent?.action?.let { action ->
-            // Update target address if provided
             intent.getStringExtra(EXTRA_DEVICE_ADDRESS)?.let {
                 targetDeviceAddress = it
                 Log.d(TAG, "Target device address updated to: $targetDeviceAddress")
             }
 
             when (action) {
-                ACTION_REQUEST_CURRENT_STATE -> {
-                    broadcastCurrentStateSnapshot()
-                }
+                ACTION_REQUEST_CURRENT_STATE -> broadcastCurrentStateSnapshot()
                 ACTION_START_SCAN -> startScan()
-                ACTION_CONNECT_DEVICE -> { // Assuming device address is already set or passed
-                    // This would typically be called after device is found by scan
-                    // For now, we assume targetDeviceAddress is set
+                ACTION_CONNECT_DEVICE -> {
                     val device = bluetoothAdapter?.getRemoteDevice(targetDeviceAddress)
-                    device?.let { connectToDevice(it) } ?: Log.e(TAG, "Cannot connect, device address invalid or BT adapter null")
+                    device?.let { connectToDevice(it) }
+                        ?: Log.e(TAG, "Cannot connect, device address invalid or BT adapter null")
                 }
                 ACTION_DISCONNECT -> disconnectDevice()
                 ACTION_REQUEST_BATTERY -> requestBatteryLevel()
                 ACTION_TOGGLE_NOTIFY -> toggleNotificationSubscription()
                 ACTION_STOP_SERVICE -> {
                     isServiceRunning = false
-                    stopSelf() // This will trigger onDestroy
-                    return START_NOT_STICKY // Don't restart
+                    stopSelf()
+                    return START_NOT_STICKY
                 }
-
-                else -> {}
+                else -> Log.w(TAG, "Unknown action received: $action")
             }
         }
-        return START_NOT_STICKY // If service is killed, restart it with the last intent
+        return START_NOT_STICKY
     }
 
+    // --- Public methods for Bound Service Interaction ---
+
+    /**
+     * Represents the various states of BLE connection.
+     */
+    enum class ConnectionState {
+        /** No active connection or connection attempt. */
+        DISCONNECTED,
+        /** Actively scanning for BLE devices. */
+        SCANNING,
+        /** Attempting to connect to a BLE device. */
+        CONNECTING,
+        /** Actively connected to a BLE device. */
+        CONNECTED
+    }
+
+    /**
+     * Initiates a BLE scan for the target device.
+     * Assumes `targetDeviceAddress` is set, either by default or via `onStartCommand`.
+     */
+    fun requestStartScan() {
+        startScan()
+    }
+
+    /**
+     * Attempts to connect to a BLE device at the given address.
+     * @param address The MAC address of the BLE device to connect to.
+     */
+    @SuppressLint("MissingPermission")
+    fun requestConnectDevice(address: String) {
+        if (bluetoothAdapter?.checkBluetoothAddress(address) == true) {
+            targetDeviceAddress = address // Update target address for subsequent operations
+            val device = bluetoothAdapter!!.getRemoteDevice(address)
+            connectToDevice(device)
+        } else {
+            Log.e(TAG, "Invalid Bluetooth address provided for connect: $address")
+            broadcastStatus("Error: Invalid device address.")
+        }
+    }
+
+    /**
+     * Requests disconnection from the currently connected BLE device.
+     */
+    fun requestDisconnect() {
+        disconnectDevice()
+    }
+
+    /**
+     * Requests a read of the battery level from the connected device.
+     * Requires `isBatteryCharacteristicReady()` to be true.
+     */
+    fun requestBatteryLevelUpdate() {
+        requestBatteryLevel()
+    }
+
+    /**
+     * Toggles the notification subscription for the heart rate characteristic.
+     * Requires `isNotifyCharacteristicReady()` to be true.
+     */
+    fun requestToggleNotify() {
+        toggleNotificationSubscription()
+    }
+
+    /**
+     * @return The current BLE connection state.
+     */
+    fun getCurrentConnectionState(): ConnectionState {
+        return when {
+            mIsConnected -> ConnectionState.CONNECTED
+            isScanning -> ConnectionState.SCANNING
+            bluetoothGatt != null && !mIsConnected -> ConnectionState.CONNECTING // Check gatt object for connecting state
+            else -> ConnectionState.DISCONNECTED
+        }
+    }
+    
+    /**
+     * @return True if the heart rate notification characteristic is discovered and supports notifications.
+     */
+    fun isNotifyCharacteristicReady(): Boolean {
+        return heartRateReceiverCharacteristic != null &&
+                (heartRateReceiverCharacteristic!!.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) > 0
+    }
+
+    /**
+     * @return True if the battery level characteristic is discovered and readable.
+     */
+    fun isBatteryCharacteristicReady(): Boolean {
+        return batteryLevelCharacteristic != null // Assuming it should be readable if not null
+    }
+
+    /**
+     * @return True if currently subscribed to heart rate notifications.
+     */
+    fun getSubscriptionState(): Boolean {
+        return isSubscribedToNotifications
+    }
+
+    // --- End of Public methods ---
 
     private fun broadcastCurrentStateSnapshot() {
         Log.d(TAG, "Broadcasting current state snapshot")
 
-        // 1. Connection Status
         if (mIsConnected) {
             LocalBroadcastManager.getInstance(this).sendBroadcast(Intent(ACTION_GATT_CONNECTED))
 
-            // 2. Services Discovered Status (only if connected)
             val batteryReady = batteryLevelCharacteristic != null
             val notifyReady = heartRateReceiverCharacteristic != null &&
                     (heartRateReceiverCharacteristic!!.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) > 0
             var detail = "Sync: "
-            if (batteryReady) detail += "Batt OK. " else detail += "Batt N/A. "
-            if (notifyReady) detail += "Notify OK." else detail += "Notify N/A."
+            detail += if (batteryReady) "Batt OK. " else "Batt N/A. "
+            detail += if (notifyReady) "Notify OK." else "Notify N/A."
             broadcastServiceDiscoveredStatus(batteryReady, notifyReady, detail)
 
-            // 3. Notification Subscription Status (only if connected and characteristic is valid)
             if (heartRateReceiverCharacteristic != null) {
                 broadcastSubscriptionChanged(isSubscribedToNotifications)
             }
-
-            // 4. Last known battery level (if you cache it, otherwise this might not be available without a read)
-            // For simplicity, we'll assume the UI shows "Battery: Ready" or "Battery: N/A" from services discovered
-            // If you have a cached `lastBatteryLevel`, send it:
-            // intent = Intent(ACTION_BATTERY_LEVEL_UPDATE)
-            // intent.putExtra(EXTRA_BATTERY_LEVEL, lastCachedBatteryLevel)
-            // LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
-
         } else {
             LocalBroadcastManager.getInstance(this).sendBroadcast(Intent(ACTION_GATT_DISCONNECTED))
-            // If not connected, other states are implicitly reset or irrelevant for the UI enabling buttons
         }
-
-        // 5. Always send the current general status message for the main status TextView
-        // You'll need to maintain a `currentGeneralStatus` field in your service that you update
-        // whenever you call `broadcastStatus` or `updateNotification`.
-        // For example, update it in your `broadcastStatus` method:
-        // this.currentGeneralStatus = message // before sending the broadcast
-        // Then here:
-        broadcastStatus(currentGeneralStatus) // Or derive it based on mIsConnected, isScanning etc.
-        updateNotification(currentGeneralStatus.substringAfter("Status: ").trim()) // Keep notification in sync
+        broadcastStatus(currentGeneralStatus) // This also updates the notification
+        // updateNotification(currentGeneralStatus.substringAfter("Status: ").trim()) // Redundant call removed
     }
 
     @SuppressLint("MissingPermission")
     private fun startScan() {
-        // This check is still a good safeguard within the service
-        val scanPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Manifest.permission.BLUETOOTH_SCAN else Manifest.permission.ACCESS_FINE_LOCATION
+        val scanPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Manifest.permission.BLUETOOTH_SCAN
+        } else {
+            Manifest.permission.ACCESS_FINE_LOCATION
+        }
         if (!checkServicePermissions(scanPermission)) {
             val errorMsg = "Scan permission ($scanPermission) missing for service. Cannot start scan."
             Log.e(TAG, errorMsg)
-            broadcastStatus(errorMsg) // Inform UI
+            broadcastStatus(errorMsg)
             updateNotification("Scan Permission Missing")
-            // Optionally stop self if critical permission is missing and service can't function
-            // stopSelf()
             return
         }
 
-//        if (!checkServicePermissions(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.ACCESS_FINE_LOCATION)) {
-//            broadcastStatus("Scan permission missing for service.")
-//            return
-//        }
         if (isScanning) {
             Log.d(TAG, "Scan already in progress.")
             return
         }
         if (bluetoothLeScanner == null) {
-            bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner // Try to re-initialize
+            bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
             if (bluetoothLeScanner == null) {
                 Log.e(TAG, "Failed to get BluetoothLeScanner.")
                 broadcastStatus("Cannot get BLE Scanner.")
@@ -288,9 +404,8 @@ class BleService : Service() {
                 Log.d(TAG, "Scan timeout.")
                 broadcastStatus("Status: Scan timeout. Device not found.")
                 isServiceRunning = false
-                stopForeground(STOP_FOREGROUND_REMOVE); // Or stopForeground(true) pre-API 33
-                stopSelf();
-
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
         }, SCAN_PERIOD)
         bluetoothLeScanner?.startScan(leScanCallback)
@@ -300,8 +415,18 @@ class BleService : Service() {
     @SuppressLint("MissingPermission")
     private fun stopScan() {
         if (!isScanning) return
-        if (!checkServicePermissions(Manifest.permission.BLUETOOTH_SCAN)) {
-            Log.e(TAG, "BLUETOOTH_SCAN permission not granted for stopping scan in service.")
+        val scanPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Manifest.permission.BLUETOOTH_SCAN
+        } else {
+            Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        if (!checkServicePermissions(scanPermission)) {
+            Log.e(TAG, "$scanPermission permission not granted for stopping scan in service.")
+            try {
+                bluetoothLeScanner?.stopScan(leScanCallback)
+            } catch (se: SecurityException){
+                Log.e(TAG, "SecurityException while stopping scan without permission: ${se.message}")
+            }
             isScanning = false
             return
         }
@@ -315,12 +440,14 @@ class BleService : Service() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             super.onScanResult(callbackType, result)
             result?.device?.let { device ->
-                if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
-                    Log.w(TAG, "BLUETOOTH_CONNECT missing, cannot get device name reliably.")
+                val deviceName = if (checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
+                    device.name ?: "Unknown"
+                } else {
+                    "Unknown (No Connect Perm)"
                 }
-                // val deviceName = device.name ?: "Unknown" // Requires BLUETOOTH_CONNECT for S+
-                Log.d(TAG, "Device found: ${device.name ?: "Unknown"} - ${device.address}")
-                broadcastDeviceFound(device.address, device.name ?: "Unknown")
+                Log.d(TAG, "Device found: $deviceName - ${device.address}")
+                broadcastDeviceFound(device.address, deviceName)
+
                 if (device.address == targetDeviceAddress) {
                     Log.d(TAG, "Target device found: ${device.address}")
                     stopScan()
@@ -339,8 +466,8 @@ class BleService : Service() {
             LocalBroadcastManager.getInstance(this@BleService).sendBroadcast(intent)
             isScanning = false
             isServiceRunning = false
-            stopForeground(STOP_FOREGROUND_REMOVE); // Or stopForeground(true) pre-API 33
-            stopSelf();
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
         }
     }
 
@@ -350,55 +477,24 @@ class BleService : Service() {
             broadcastStatus("Connect permission missing for service.")
             return
         }
-        stopScan() // Ensure scan is stopped before connecting
-        broadcastStatus("Status: Connecting to ${device.name ?: device.address}...")
-        updateNotification("Connecting to ${device.name ?: device.address}")
+        stopScan()
+        val deviceName = device.name ?: device.address
+        broadcastStatus("Status: Connecting to $deviceName...")
+        updateNotification("Connecting to $deviceName")
         Log.d(TAG, "Attempting to connect to GATT server on device: ${device.address}")
 
-        bluetoothGatt =
-            device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        bluetoothGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
-
 
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
-            val deviceAddress = gatt?.device?.address
+            val deviceAddress = gatt?.device?.address ?: "Unknown address"
             Log.d(TAG, "onConnectionStateChange: Address: $deviceAddress, Status: $status, NewState: $newState")
 
             when (newState) {
-                BluetoothProfile.STATE_CONNECTED -> {
-                    Log.i(TAG, "Successfully connected to $deviceAddress")
-                    mIsConnected = true
-                    if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
-                        Log.w(TAG, "BLUETOOTH_CONNECT missing, cannot get device name or discover services reliably.")
-                        broadcastStatus("Status: Connected (Connect perm missing)")
-                        updateNotification("Connected (perm issue)")
-                        LocalBroadcastManager.getInstance(this@BleService).sendBroadcast(Intent(ACTION_GATT_CONNECTED))
-                        return
-                    }
-                    val deviceName = gatt?.device?.name ?: deviceAddress
-                    broadcastStatus("Status: Connected to $deviceName")
-                    updateNotification("Connected to $deviceName")
-                    LocalBroadcastManager.getInstance(this@BleService).sendBroadcast(Intent(ACTION_GATT_CONNECTED))
-
-                    Log.d(TAG, "Attempting to discover services...")
-                    val discovered = gatt?.discoverServices()
-                    Log.d(TAG, "discoverServices() called, result: $discovered")
-                }
-                BluetoothProfile.STATE_DISCONNECTED -> {
-                    Log.i(TAG, "Disconnected from $deviceAddress")
-                    mIsConnected = false
-                    isSubscribedToNotifications = false
-                    broadcastStatus("Status: Disconnected")
-                    updateNotification("Disconnected")
-                    LocalBroadcastManager.getInstance(this@BleService).sendBroadcast(Intent(ACTION_GATT_DISCONNECTED))
-                    stopRecordingToFile(false);
-                    closeGatt() // Close GATT client
-                    isServiceRunning = false
-                    stopForeground(STOP_FOREGROUND_REMOVE); // Or stopForeground(true) pre-API 33
-                    stopSelf();
-                }
+                BluetoothProfile.STATE_CONNECTED -> handleGattConnected(gatt)
+                BluetoothProfile.STATE_DISCONNECTED -> handleGattDisconnected(deviceAddress)
                 BluetoothProfile.STATE_CONNECTING -> {
                     broadcastStatus("Status: Connecting...")
                     updateNotification("Connecting...")
@@ -410,48 +506,11 @@ class BleService : Service() {
             }
         }
 
-
-
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
-            if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
-                Log.w(TAG, "BLUETOOTH_CONNECT missing, cannot process discovered services.")
-                broadcastServiceDiscoveredStatus(false, false, "Perm missing")
-                return
-            }
-
-            var batteryReady = false
-            var notifyReady = false
-            var workoutReady = false
-            var detailMessage = ""
-
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.i(TAG, "Services discovered successfully!")
-                val batteryService = gatt?.getService(BATTERY_SERVICE_UUID)
-                batteryLevelCharacteristic = batteryService?.getCharacteristic(BATTERY_LEVEL_CHARACTERISTIC_UUID)
-                batteryReady = batteryLevelCharacteristic != null
-                if (!batteryReady) detailMessage += "Battery Char N/A. "
-
-                val heartRateService = gatt?.getService(HEART_RATE_SERVICE_UUID)
-
-                heartRateReceiverCharacteristic = heartRateService?.getCharacteristic(HEART_RATE_READER_CHARACTERISTIC_UUID)
-                notifyReady = heartRateReceiverCharacteristic != null &&
-                        (heartRateReceiverCharacteristic!!.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) > 0
-                if (!notifyReady) detailMessage += "Notify Char N/A or no notify prop. "
-
-                workoutCharacteristic =
-                    heartRateService?.getCharacteristic(WORKOUT_CHARACTERISTIC_UUID)
-                workoutReady = workoutCharacteristic != null &&
-                        ((workoutCharacteristic!!.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) > 0 ||
-                                (workoutCharacteristic!!.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) > 0)
-                if (!workoutReady) detailMessage += "Workout Char N/A or no write prop. "
-
-            } else {
-                Log.w(TAG, "Service discovery failed with status: $status")
-                detailMessage = "Discovery Fail ($status)"
-            }
-            broadcastServiceDiscoveredStatus(batteryReady, notifyReady, detailMessage.ifEmpty { "Ready" })
+            processDiscoveredServices(gatt, status)
         }
+
         @Deprecated("Used for devices prior to Tiramisu")
         override fun onCharacteristicRead(
             gatt: BluetoothGatt,
@@ -463,13 +522,17 @@ class BleService : Service() {
                 handleCharacteristicRead(characteristic, characteristic.value, status)
             }
         }
+
         override fun onCharacteristicRead(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray,
             status: Int
         ) {
-            if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) return
+            if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
+                 Log.e(TAG, "BLUETOOTH_CONNECT permission missing for onCharacteristicRead.")
+                return
+            }
             handleCharacteristicRead(characteristic, value, status)
         }
 
@@ -479,24 +542,16 @@ class BleService : Service() {
             status: Int
         ) {
             Log.d(TAG, "onCharacteristicRead UUID: ${characteristic.uuid}, Status: $status, Value: ${value.toHexString()}")
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                if (characteristic.uuid == BATTERY_LEVEL_CHARACTERISTIC_UUID) {
-                    if (value.isNotEmpty()) {
-                        val batteryLevel = value[0].toInt() and 0xFF // Ensure unsigned
-                        Log.i(TAG, "Battery Level read: $batteryLevel%")
-                        broadcastBatteryLevel(batteryLevel)
-                    } else {
-                        Log.w(TAG, "Battery Level characteristic read but value is empty.")
-                        broadcastBatteryLevel(-1) // Indicate error or empty
-                    }
-                }
+            if (characteristic.uuid == BATTERY_LEVEL_CHARACTERISTIC_UUID) {
+                processBatteryLevelRead(value, status)
             } else {
-                Log.w(TAG, "Characteristic read failed for ${characteristic.uuid}, status: $status")
-                if (characteristic.uuid == BATTERY_LEVEL_CHARACTERISTIC_UUID) {
-                    broadcastBatteryLevel(-2) // Indicate read fail
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                     Log.w(TAG, "Characteristic read failed for ${characteristic.uuid}, status: $status")
                 }
+                // Handle other characteristics if any
             }
         }
+
         @Deprecated("Used for devices prior to Tiramisu")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
@@ -507,16 +562,20 @@ class BleService : Service() {
                 handleCharacteristicChanged(characteristic, characteristic.value)
             }
         }
+
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) return
+            if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
+                Log.e(TAG, "BLUETOOTH_CONNECT permission missing for onCharacteristicChanged.")
+                return
+            }
             handleCharacteristicChanged(characteristic, value)
         }
 
-        private var writeCount = 0 // Add this as a class-level variable
+        // writeCount is now managed by HeartRateFileLogger
 
         private fun handleCharacteristicChanged(
             characteristic: BluetoothGattCharacteristic,
@@ -524,69 +583,25 @@ class BleService : Service() {
         ) {
             Log.d(TAG, "onCharacteristicChanged UUID: ${characteristic.uuid}, Value: ${value.toHexString()}")
             if (characteristic.uuid == HEART_RATE_READER_CHARACTERISTIC_UUID) {
-                if (value.size >= 4 &&
-                    value[0] == 0xE5.toByte() &&
-                    value[1] == 0x11.toByte() &&
-                    value[2] == 0x00.toByte()) {
-                    val heartRateHexByte = value[3]
-                    val heartRateDecimal = heartRateHexByte.toInt() and 0xFF
-                    Log.i(TAG, "Heart Rate Data: $heartRateDecimal bpm")
-                    broadcastNotificationData("HR: $heartRateDecimal bpm")
-
-                    fileWriterHandler?.post {
-                        try {
-                            val timestamp = System.currentTimeMillis()
-                            writer?.appendLine("$timestamp,$heartRateDecimal")
-
-                            // Increment counter and flush every 10 writes
-                            writeCount++
-                            if (writeCount >= 10) {
-                                writer?.flush()
-                                writeCount = 0
-                                Log.d(TAG, "Flushed writer to file")
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Error writing to heart rate file", e)
-                        }
-                    }
-                }
+                processHeartRateData(value)
             }
+            // Handle other characteristic changes if any
         }
 
         @RequiresApi(Build.VERSION_CODES.Q)
         override fun onDescriptorWrite(gatt: BluetoothGatt?, descriptor: BluetoothGattDescriptor?, status: Int) {
-            if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) return
+            if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
+                Log.e(TAG, "BLUETOOTH_CONNECT permission missing for onDescriptorWrite.")
+                return
+            }
 
             if (descriptor?.uuid == CCCD_UUID && descriptor.characteristic.uuid == HEART_RATE_READER_CHARACTERISTIC_UUID) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    isSubscribedToNotifications = !isSubscribedToNotifications;
-                    broadcastStatus("Notifications ${if(isSubscribedToNotifications) "Enabled" else "Disabled"}")
-                    broadcastSubscriptionChanged(isSubscribedToNotifications)
-                    if(isSubscribedToNotifications){
-                        val startWorkout: ByteArray = byteArrayOf(
-                            0xFD.toByte(), // FD
-                            0x11.toByte(), // 11
-                            0x01.toByte(), // 01
-                            0x01.toByte()  // 01
-                        )
-                        writeCommand(startWorkout);
-                        startRecordingToFile();
-                    }
-                    else{
-                        val endWorkout: ByteArray = byteArrayOf(
-                            0xFD.toByte(), // FD
-                            0x00.toByte(), // 00
-                            0x01.toByte(), // 01
-                            0x01.toByte()  // 01
-                        )
-                        writeCommand(endWorkout);
-                        stopRecordingToFile();
-                    }
-                    Log.i(TAG, "CCCD for custom notify written. Notifications ${if (isSubscribedToNotifications) "enabled" else "disabled"}.")
+                    isSubscribedToNotifications = !isSubscribedToNotifications
+                    handleSuccessfulDescriptorWrite(isSubscribedToNotifications)
                 } else {
-                    Log.e(TAG, "CCCD write for custom notify failed: $status")
+                    Log.e(TAG, "CCCD write for HR Notify failed: $status")
                     broadcastStatus("Failed to set notifications")
-                    // Optionally broadcast failure to revert UI state
                 }
             }
         }
@@ -602,7 +617,8 @@ class BleService : Service() {
             broadcastStatus("Connect permission missing to read battery.")
             return
         }
-        bluetoothGatt?.readCharacteristic(batteryLevelCharacteristic)
+        val success = bluetoothGatt?.readCharacteristic(batteryLevelCharacteristic)
+        Log.d(TAG, "Attempting to read battery level, success: $success")
     }
 
     @SuppressLint("MissingPermission")
@@ -619,46 +635,51 @@ class BleService : Service() {
         val characteristic = heartRateReceiverCharacteristic!!
         val enable = !isSubscribedToNotifications
 
-        bluetoothGatt?.setCharacteristicNotification(characteristic, enable)
-        //Thread.sleep(100) // Small delay sometimes helps, but try without first
+        val notificationSet = bluetoothGatt?.setCharacteristicNotification(characteristic, enable)
+        Log.d(TAG, "setCharacteristicNotification for ${characteristic.uuid} to $enable: $notificationSet")
 
         val cccdDescriptor = characteristic.getDescriptor(CCCD_UUID)
         if (cccdDescriptor != null) {
-            val descriptorValue = if (enable) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-            Log.d(TAG, "Writing to CCCD: ${descriptorValue.toHexString()} to enable: $enable")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                val result = bluetoothGatt?.writeDescriptor(cccdDescriptor, descriptorValue)
-                Log.d(TAG, "writeDescriptor (T+ API) result: $result")
+            val descriptorValue = if (enable) {
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            } else {
+                BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+            }
+            Log.d(TAG, "Writing to CCCD ${cccdDescriptor.uuid}: ${descriptorValue.toHexString()} to enable: $enable")
+
+            val writeSuccess: Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                bluetoothGatt?.writeDescriptor(cccdDescriptor, descriptorValue) == BluetoothStatusCodes.SUCCESS
             } else {
                 cccdDescriptor.value = descriptorValue
-                val result = bluetoothGatt?.writeDescriptor(cccdDescriptor)
-                Log.d(TAG, "writeDescriptor (legacy API) result: $result")
+                bluetoothGatt?.writeDescriptor(cccdDescriptor) ?: false
             }
+            Log.d(TAG, "writeDescriptor for CCCD call result: $writeSuccess")
         } else {
-            Log.w(TAG, "CCCD not found for custom characteristic. Assuming notifications toggled by setCharacteristicNotification.")
-            isSubscribedToNotifications = enable // Update state optimistically
-            broadcastStatus("Notifications ${if(enable) "Enabled (No CCCD)" else "Disabled (No CCCD)"}")
+            Log.w(TAG, "CCCD not found for characteristic ${characteristic.uuid}. Assuming notifications toggled by setCharacteristicNotification.")
+            isSubscribedToNotifications = enable
+            broadcastStatus("Notifications ${if (enable) "Enabled (No CCCD)" else "Disabled (No CCCD)"}")
             broadcastSubscriptionChanged(enable)
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun disconnectDevice() {
-        if (bluetoothGatt == null) return
+        if (bluetoothGatt == null) {
+            Log.d(TAG, "disconnectDevice called, but GATT is already null.")
+            return
+        }
         if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
             broadcastStatus("Connect permission missing for disconnect.")
-            // Force close if permission is missing to avoid leaks, though it's not ideal
             closeGatt()
-            mIsConnected = false // Manually update state
+            mIsConnected = false
             broadcastStatus("Status: Disconnected (Perm Error)")
             updateNotification("Disconnected (Perm Error)")
             LocalBroadcastManager.getInstance(this@BleService).sendBroadcast(Intent(ACTION_GATT_DISCONNECTED))
             return
         }
 
-        // Polite unsubscribe (optional, but good)
         if (isSubscribedToNotifications && heartRateReceiverCharacteristic != null) {
+            Log.d(TAG, "Attempting to unsubscribe from notifications before disconnecting.")
             bluetoothGatt?.setCharacteristicNotification(heartRateReceiverCharacteristic!!, false)
             val cccd = heartRateReceiverCharacteristic!!.getDescriptor(CCCD_UUID)
             if (cccd != null) {
@@ -669,33 +690,33 @@ class BleService : Service() {
                     cccd.value = value
                     bluetoothGatt?.writeDescriptor(cccd)
                 }
-                // No immediate callback needed here, disconnect will follow
             }
         }
-        bluetoothGatt?.disconnect() // Triggers onConnectionStateChange -> STATE_DISCONNECTED
+        bluetoothGatt?.disconnect()
     }
 
     @SuppressLint("MissingPermission")
     private fun closeGatt() {
         if (bluetoothGatt == null) {
-            Log.d(TAG, "disconnectDevice called, but GATT is already null. Stopping service.");
-            // No active GATT connection to disconnect, so stop the service directly
-            stopRecordingToFile(false);
-            isServiceRunning = false
-            stopForeground(STOP_FOREGROUND_REMOVE); // Or stopForeground(true) pre-API 33
-            stopSelf();
-            return;
+            Log.d(TAG, "closeGatt called, but GATT is already null. Service may stop if not running.")
+            if (!isServiceRunning) {
+                 heartRateFileLogger.stopRecording(false)
+                 stopForeground(STOP_FOREGROUND_REMOVE)
+                 stopSelf()
+            }
+            return
         }
         if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
             Log.e(TAG, "BLUETOOTH_CONNECT permission not granted for closing GATT in service.")
-            bluetoothGatt = null // Just nullify to prevent further use if perm missing
-            return
+        } else {
+            bluetoothGatt?.disconnect()
         }
-        bluetoothGatt?.disconnect()
+        bluetoothGatt?.close()
         bluetoothGatt = null
         batteryLevelCharacteristic = null
         heartRateReceiverCharacteristic = null
         workoutCharacteristic = null
+        mIsConnected = false
         Log.d(TAG, "GATT closed.")
     }
 
@@ -704,41 +725,38 @@ class BleService : Service() {
         Log.d(TAG, "BleService destroyed.")
         stopScan()
         isServiceRunning = false
-        disconnectDevice() // This will also call closeGatt() in its flow
-        // Ensure GATT is closed if disconnect didn't complete for some reason
-        if (bluetoothGatt != null) {
-            closeGatt()
-        }
-        handler.removeCallbacksAndMessages(null) // Remove any pending scan timeouts
-        fileWriterHandlerThread?.quitSafely()
-        stopRecordingToFile(false);
+        disconnectDevice()
+        closeGatt()
 
-        stopForeground(STOP_FOREGROUND_REMOVE) // Remove notification
-        stopSelf();
+        handler.removeCallbacksAndMessages(null)
+        heartRateFileLogger.close() // Close the logger
+        fileWriterHandlerThread?.quitSafely() // Quit the handler thread for file I/O
+        // stopRecordingToFile(false) // This was already handled by heartRateFileLogger.close()
+
+        stopForeground(STOP_FOREGROUND_REMOVE)
         Log.d(TAG, "BleService cleanup complete.")
     }
 
-
     // --- Helper methods for broadcasting ---
     private fun broadcastStatus(message: String) {
-        currentGeneralStatus = message // Store the latest status
+        currentGeneralStatus = message // Instance variable is now updated
         val intent = Intent(ACTION_STATUS_UPDATE)
         intent.putExtra(EXTRA_STATUS_MESSAGE, message)
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
 
         if (message.startsWith("Status:")) {
-            updateNotification(message.substringAfter("Status: "))
+            updateNotification(message.substringAfter("Status: ").trim())
         } else {
-            updateNotification(message) // Or a default if message isn't suitable
+            updateNotification(message)
         }
     }
+
     private fun broadcastDeviceFound(address: String, name: String) {
         val intent = Intent(ACTION_DEVICE_FOUND)
         intent.putExtra(EXTRA_DEVICE_ADDRESS, address)
-        intent.putExtra(EXTRA_STATUS_MESSAGE, "Found: $name ($address)") // Using status message key for simplicity
+        intent.putExtra(EXTRA_STATUS_MESSAGE, "Found: $name ($address)")
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
-
 
     private fun broadcastBatteryLevel(level: Int) {
         val intent = Intent(ACTION_BATTERY_LEVEL_UPDATE)
@@ -756,15 +774,15 @@ class BleService : Service() {
         val intent = Intent(ACTION_SERVICES_DISCOVERED_STATUS)
         intent.putExtra(EXTRA_IS_BATTERY_READY, batteryReady)
         intent.putExtra(EXTRA_IS_NOTIFY_READY, notifyReady)
-        intent.putExtra(EXTRA_STATUS_MESSAGE, detail) // Re-using for simplicity
+        intent.putExtra(EXTRA_STATUS_MESSAGE, detail)
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
+
     private fun broadcastSubscriptionChanged(isSubscribed: Boolean) {
         val intent = Intent(ACTION_NOTIFICATION_SUBSCRIPTION_CHANGED)
         intent.putExtra(EXTRA_IS_SUBSCRIBED, isSubscribed)
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
-
 
     private fun checkServicePermissions(vararg permissions: String): Boolean {
         return permissions.all { permission ->
@@ -772,10 +790,9 @@ class BleService : Service() {
         }
     }
 
-    // BleService.kt
     @SuppressLint("MissingPermission")
     private fun writeCommand(commandBytes: ByteArray) {
-        if (!mIsConnected || bluetoothGatt == null ||  workoutCharacteristic == null) {
+        if (!mIsConnected || bluetoothGatt == null || workoutCharacteristic == null) {
             Log.w(TAG, "Cannot write command: Not connected or command characteristic not available.")
             broadcastStatus("Error: Command characteristic not ready.")
             return
@@ -789,100 +806,158 @@ class BleService : Service() {
         val char = workoutCharacteristic!!
         Log.d(TAG, "Writing command: ${commandBytes.toHexString()} to ${char.uuid}")
 
-        // Check write type
         val writeType = if ((char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) > 0) {
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         } else if ((char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) > 0) {
-            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT // Or WRITE_TYPE_SIGNED if your peripheral needs it
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         } else {
-            Log.e(TAG, "Command characteristic is not writable.")
+            Log.e(TAG, "Command characteristic ${char.uuid} is not writable.")
             broadcastStatus("Error: Command characteristic not writable.")
             return
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            bluetoothGatt?.writeCharacteristic(char, commandBytes, writeType)
+        val success: Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            bluetoothGatt?.writeCharacteristic(char, commandBytes, writeType) == BluetoothStatusCodes.SUCCESS
         } else {
             char.value = commandBytes
             char.writeType = writeType
-            bluetoothGatt?.writeCharacteristic(char)
+            bluetoothGatt?.writeCharacteristic(char) ?: false
         }
-        // The result of this write will come in the onCharacteristicWrite callback
+        Log.d(TAG, "writeCharacteristic for command ${commandBytes.toHexString()} to ${char.uuid} with type $writeType, system call result: $success")
     }
 
-    @RequiresApi(Build.VERSION_CODES.Q)
-    private fun startRecordingToFile() {
-        if (writer != null) { // Already recording
-            Log.w(TAG, "Already recording to a file.")
+    // Old startRecordingToFile and stopRecordingToFile methods are removed as their logic
+    // is now handled by HeartRateFileLogger.
+
+    private fun ByteArray.toHexString(): String =
+        joinToString(separator = " ") { byte -> "%02X".format(byte) }
+
+    @SuppressLint("MissingPermission")
+    private fun handleGattConnected(gatt: BluetoothGatt?) {
+        val deviceAddress = gatt?.device?.address ?: "Unknown address"
+        Log.i(TAG, "Successfully connected to $deviceAddress")
+        mIsConnected = true
+        val deviceName = if (checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
+            gatt?.device?.name ?: deviceAddress
+        } else {
+            deviceAddress
+        }
+        broadcastStatus("Status: Connected to $deviceName")
+        updateNotification("Connected to $deviceName")
+        LocalBroadcastManager.getInstance(this@BleService).sendBroadcast(Intent(ACTION_GATT_CONNECTED))
+
+        Log.d(TAG, "Attempting to discover services...")
+        if (checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
+            val discovered = gatt?.discoverServices()
+            Log.d(TAG, "discoverServices() called, result: $discovered")
+        } else {
+            Log.e(TAG, "Cannot discover services, BLUETOOTH_CONNECT permission missing.")
+            broadcastStatus("Status: Connected (Service discovery failed - perm missing)")
+        }
+    }
+
+    private fun handleGattDisconnected(deviceAddress: String?) {
+        Log.i(TAG, "Disconnected from $deviceAddress")
+        mIsConnected = false
+        isSubscribedToNotifications = false
+        broadcastStatus("Status: Disconnected")
+        updateNotification("Disconnected")
+        LocalBroadcastManager.getInstance(this@BleService).sendBroadcast(Intent(ACTION_GATT_DISCONNECTED))
+        heartRateFileLogger.stopRecording(false)
+        closeGatt()
+        isServiceRunning = false
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun processDiscoveredServices(gatt: BluetoothGatt?, status: Int) {
+        if (!checkServicePermissions(Manifest.permission.BLUETOOTH_CONNECT)) {
+            Log.w(TAG, "BLUETOOTH_CONNECT missing, cannot process discovered services.")
+            broadcastServiceDiscoveredStatus(false, false, "Perm missing for service discovery")
             return
         }
 
-        val fileName = "HeartRate_Data_${System.currentTimeMillis()}.csv"
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-            put(MediaStore.MediaColumns.MIME_TYPE, "text/csv")
-            // For Android Q (API 29) and above, save to Downloads directory
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-            }
-            // For older versions, you might need to construct a full path if not using MediaStore
-            // but for simplicity, this example focuses on API 29+ for Downloads.
+        var batteryReady = false
+        var notifyReady = false
+        var detailMessage = ""
+
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            Log.i(TAG, "Services discovered successfully!")
+            val batteryService = gatt?.getService(BATTERY_SERVICE_UUID)
+            batteryLevelCharacteristic = batteryService?.getCharacteristic(BATTERY_LEVEL_CHARACTERISTIC_UUID)
+            batteryReady = batteryLevelCharacteristic != null
+            if (!batteryReady) detailMessage += "Battery Char N/A. "
+
+            val heartRateService = gatt?.getService(HEART_RATE_SERVICE_UUID)
+            heartRateReceiverCharacteristic = heartRateService?.getCharacteristic(HEART_RATE_READER_CHARACTERISTIC_UUID)
+            notifyReady = heartRateReceiverCharacteristic != null &&
+                    (heartRateReceiverCharacteristic!!.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) > 0
+            if (!notifyReady) detailMessage += "Notify Char N/A or no notify prop. "
+
+            workoutCharacteristic = heartRateService?.getCharacteristic(WORKOUT_CHARACTERISTIC_UUID)
+            val workoutIsWritable = workoutCharacteristic != null &&
+                    ((workoutCharacteristic!!.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) > 0 ||
+                            (workoutCharacteristic!!.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) > 0)
+            if (!workoutIsWritable) detailMessage += "Workout Char N/A or no write prop. "
+
+        } else {
+            Log.w(TAG, "Service discovery failed with status: $status")
+            detailMessage = "Discovery Fail ($status)"
         }
+        broadcastServiceDiscoveredStatus(batteryReady, notifyReady, detailMessage.ifEmpty { "Ready" })
+    }
 
-        val resolver = applicationContext.contentResolver
-        try {
-            currentFileUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
-            if (currentFileUri == null) {
-                Log.e(TAG, "Failed to create new MediaStore entry.")
-                broadcastStatus("Error: Could not create file for recording.")
-                return
+    private fun logHeartRateDataToFile(timestamp: Long, heartRate: Int) {
+        heartRateFileLogger.logData(timestamp, heartRate)
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    @SuppressLint("MissingPermission")
+    private fun handleSuccessfulDescriptorWrite(isNowSubscribed: Boolean) {
+        broadcastStatus("Notifications ${if (isNowSubscribed) "Enabled" else "Disabled"}")
+        broadcastSubscriptionChanged(isNowSubscribed)
+        if (isNowSubscribed) {
+            val startWorkout = byteArrayOf(0xFD.toByte(), 0x11.toByte(), 0x01.toByte(), 0x01.toByte())
+            writeCommand(startWorkout)
+            heartRateFileLogger.startRecording()
+        } else {
+            val endWorkout = byteArrayOf(0xFD.toByte(), 0x00.toByte(), 0x01.toByte(), 0x01.toByte())
+            writeCommand(endWorkout)
+            heartRateFileLogger.stopRecording()
+        }
+        Log.i(TAG, "CCCD for HR Notify processed. Notifications now ${if (isNowSubscribed) "enabled" else "disabled"}.")
+    }
+
+    private fun processBatteryLevelRead(value: ByteArray, status: Int) {
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            if (value.isNotEmpty()) {
+                val batteryLevel = value[0].toInt() and 0xFF
+                Log.i(TAG, "Battery Level read: $batteryLevel%")
+                broadcastBatteryLevel(batteryLevel)
+            } else {
+                Log.w(TAG, "Battery Level characteristic read but value is empty.")
+                broadcastBatteryLevel(-1)
             }
-
-            resolver.openOutputStream(currentFileUri!!)?.let { outputStream ->
-                fileOutputStream = outputStream as FileOutputStream // Keep if needed for direct FileOutputStream features
-                writer = BufferedWriter(OutputStreamWriter(outputStream))
-                // Optional: Write a header row
-                writer?.appendLine("Timestamp,HeartRate")
-                writer?.flush()
-                Log.i(TAG, "Started recording heart rate to: $fileName in Downloads")
-                broadcastStatus("Recording started: $fileName")
-            } ?: run {
-                Log.e(TAG, "Failed to open output stream for $currentFileUri")
-                broadcastStatus("Error: Could not open file for recording.")
-            }
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Error starting file recording", e)
-            broadcastStatus("Error: File recording failed to start.")
-            stopRecordingToFile(false) // Clean up
+        } else {
+            Log.w(TAG, "Battery Level read failed with status: $status")
+            broadcastBatteryLevel(-2)
         }
     }
-    private fun stopRecordingToFile(notifySuccess: Boolean = true) {
-        try {
-            writer?.flush()
-            writer?.close()
-            fileOutputStream?.close() // Though writer.close() should close the underlying stream
-            Log.i(TAG, "Stopped recording heart rate. File URI: $currentFileUri")
-            if (notifySuccess && currentFileUri != null) {
-                val fileName = currentFileUri?.let { uri ->
-                    // Try to get the display name from MediaStore
-                    applicationContext.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-                        if (cursor.moveToFirst()) {
-                            cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME))
-                        } else null
-                    }
-                } ?: "UnknownFile.csv"
-                broadcastStatus("Recording stopped. Saved to Downloads/$fileName")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping file recording", e)
-        } finally {
-            writer = null
-            fileOutputStream = null
-            currentFileUri = null
+
+    private fun processHeartRateData(value: ByteArray) {
+        if (value.size >= 4 &&
+            value[0] == 0xE5.toByte() &&
+            value[1] == 0x11.toByte() &&
+            value[2] == 0x00.toByte()
+        ) {
+            val heartRateHexByte = value[3]
+            val heartRateDecimal = heartRateHexByte.toInt() and 0xFF
+            Log.i(TAG, "Heart Rate Data: $heartRateDecimal bpm")
+            broadcastNotificationData("HR: $heartRateDecimal bpm")
+            logHeartRateDataToFile(System.currentTimeMillis(), heartRateDecimal) // This call remains
+        } else {
+            Log.w(TAG, "Received unexpected data format for HR characteristic: ${value.toHexString()}")
         }
     }
-    // Helper to convert ByteArray to Hex String
-    private fun ByteArray.toHexString(): String =
-        joinToString(separator = " ") { byte -> "%02X".format(byte) }
 }
